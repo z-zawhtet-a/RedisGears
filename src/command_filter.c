@@ -8,16 +8,26 @@
 #include "lock_handler.h"
 #include <ctype.h>
 
-#define COMMAND_FILTER_ARG_NAME "CommandFilterArg"
-#define COMMAND_FILTER_ARG_VERSION 1
+#define REGISTER_COMMAND_ARG_VERSION 1
+#define UNREGISTER_COMMAND_ARG_VERSION 1
 
 #define INNER_OVERIDE_COMMAND "rg.inneroveride"
 #define INNER_OVERIDE_SLAVE_COMMAND "rg.inneroverideslave"
+#define INNER_REGISTER_COMMAND_FILTER "rg.innerregistercommandfilter"
+#define INNER_UNREGISTER_COMMAND_FILTER "rg.innerunregistercommandfilter"
+
+static bool invokedInternaly = false;
 
 #define COMMAND_FILTER_DATATYPE_NAME "GEARS_CF0"
 #define COMMAND_FILTER_DATATYPE_VERSION 1
 
-static int CommandFilter_Serialize(FlatExecutionPlan* fep, void* arg, Gears_BufferWriter* bw, char** err);
+typedef struct CallbackCtx CallbackCtx;
+typedef struct CommandCtx CommandCtx;
+
+static int CommandFilter_RegisterArgSerialize(FlatExecutionPlan* fep, void* arg, Gears_BufferWriter* bw, char** err);
+static void CommandFilter_FreeCommandCtx(CommandCtx* cmdCtx);
+static void CommandFilter_FreeCallbackCtx(CallbackCtx* callbackCtx);
+static void CommandFilter_RegisterArgFree(void* arg);
 
 typedef struct CallbackCtx{
     void* pd;
@@ -34,21 +44,52 @@ typedef struct CommandInfoCtx{
     RedisGears_CommandCallback c;
 }CommandInfoCtx;
 
-typedef struct CommandCtx{
+typedef struct CommandInfoUnregisterCtx{
     char* name;
     size_t index;
+}CommandInfoUnregisterCtx;
+
+typedef struct CommandCtx{
+    char* name;
+    int index;
     CallbackCtx* callbacks;
 }CommandCtx;
 
-static RedisModuleCommandFilter* filterObj;
-RedisModuleType *FilterDataType;
-static Gears_dict* commandDict;
-static ArgType* commandFilterArgType;
+static RedisModuleCommandFilter* filterObj = NULL;
+static RedisModuleType *FilterDataType = NULL;
+static Gears_dict* commandDict = NULL;
+static ArgType* registerCommandArgType = NULL;
+static ArgType* unregisterCommandArgType = NULL;
 
 static CommandCtx* currCmdCtx;
 static RedisModuleString* overideCmdName;
 
+static void CommandFilter_RegisterFilterIfNoRegitered(){
+    if(!filterObj){
+        RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(NULL);
+        invokedInternaly = true;
+        RedisModuleCallReply *rep = RedisModule_Call(ctx, INNER_REGISTER_COMMAND_FILTER, "");
+        invokedInternaly = false;
+        RedisModule_FreeCallReply(rep);
+        RedisModule_FreeThreadSafeContext(ctx);
+    }
+}
+
+static void CommandFilter_UnregisterFilter(){
+    if(filterObj){
+        RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(NULL);
+        invokedInternaly = true;
+        RedisModuleCallReply *rep = RedisModule_Call(ctx, INNER_UNREGISTER_COMMAND_FILTER, "");
+        invokedInternaly = false;
+        RedisModule_FreeCallReply(rep);
+        RedisModule_FreeThreadSafeContext(ctx);
+    }
+}
+
 static void CommandFilter_Filter(RedisModuleCommandFilterCtx *filter){
+    if(!commandDict){
+        return;
+    }
     if(Gears_dictSize(commandDict) == 0){
         return;
     }
@@ -73,6 +114,7 @@ static void CommandFilter_Filter(RedisModuleCommandFilterCtx *filter){
 
 static CommandCtx* CommandFilter_GetOrCreate(const char* name){
 #define CALLBACKS_INIT_CAP 5
+    CommandFilter_RegisterFilterIfNoRegitered();
     CommandCtx* cmdCtx = Gears_dictFetchValue(commandDict, name);
     if(!cmdCtx){
         cmdCtx = RG_ALLOC(sizeof(*cmdCtx) + sizeof(CallbackCtx));
@@ -95,6 +137,40 @@ static void CommandFilter_AddCallbackCtx(CommandCtx* cmdCtx, CommandInfoCtx* cmd
     cmdCtx->index++;
 }
 
+static void CommandFilter_UnregisterOnShard(ExecutionCtx* rctx, Record *data, void* arg){
+    RedisModuleCtx* ctx = RedisGears_GetRedisModuleCtx(rctx);
+    LockHandler_Acquire(ctx);
+
+    CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = arg;
+
+    CommandCtx* cmdCtx = Gears_dictFetchValue(commandDict, cmdInfoUnregisterCtx->name);
+    if(!cmdCtx){
+        RedisGears_SetError(rctx, RG_STRDUP("Give command does not exists"));
+        LockHandler_Release(ctx);
+        return;
+    }
+
+    if(cmdInfoUnregisterCtx->index < 0 || cmdInfoUnregisterCtx->index >= array_len(cmdCtx->callbacks)){
+        RedisGears_SetError(rctx, RG_STRDUP("Give index is out of range"));
+        LockHandler_Release(ctx);
+        return;
+    }
+
+    CommandFilter_FreeCallbackCtx(cmdCtx->callbacks + cmdInfoUnregisterCtx->index);
+    array_del(cmdCtx->callbacks, cmdInfoUnregisterCtx->index);
+    --cmdCtx->index;
+
+    if(array_len(cmdCtx->callbacks) == 0){
+        Gears_dictDelete(commandDict, cmdInfoUnregisterCtx->name);
+        CommandFilter_FreeCommandCtx(cmdCtx);
+        if(Gears_dictSize(commandDict) == 0){
+            CommandFilter_UnregisterFilter();
+        }
+    }
+
+    LockHandler_Release(ctx);
+}
+
 static void CommandFilter_RegisterOnShard(ExecutionCtx* rctx, Record *data, void* arg){
     RedisModuleCtx* ctx = RedisGears_GetRedisModuleCtx(rctx);
     LockHandler_Acquire(ctx);
@@ -114,9 +190,9 @@ static void CommandFilter_RegisterOnShard(ExecutionCtx* rctx, Record *data, void
     Gears_BufferWriter bw;
     Gears_BufferWriterInit(&bw, buff);
     char* err = NULL;
-    int res = CommandFilter_Serialize(NULL, cmdInfoCtx, &bw, &err);
+    int res = CommandFilter_RegisterArgSerialize(NULL, cmdInfoCtx, &bw, &err);
     RedisModule_Assert(res == REDISMODULE_OK);
-    RedisModule_Replicate(ctx, INNER_OVERIDE_SLAVE_COMMAND, "lb", COMMAND_FILTER_ARG_VERSION, buff->buff, buff->size);
+    RedisModule_Replicate(ctx, INNER_OVERIDE_SLAVE_COMMAND, "lb", REGISTER_COMMAND_ARG_VERSION, buff->buff, buff->size);
     Gears_BufferFree(buff);
 
     LockHandler_Release(ctx);
@@ -124,6 +200,22 @@ static void CommandFilter_RegisterOnShard(ExecutionCtx* rctx, Record *data, void
 
 static void CommandFilter_dropExecutionOnDone(ExecutionPlan* ep, void* privateData){
     RedisGears_DropExecution(ep);
+}
+
+static void CommandFilter_SendReply(ExecutionPlan* ep, void* privateData){
+    RedisModuleBlockedClient *bc = privateData;
+    RedisModuleCtx* ctx = RedisModule_GetThreadSafeContext(bc);
+    size_t nerrors = RedisGears_GetErrorsLen(ep);
+    if(nerrors){
+        Record* error = RedisGears_GetError(ep, 0);
+        const char* errorStr = RedisGears_StringRecordGet(error, NULL);
+        RedisModule_ReplyWithError(ctx, errorStr);
+        return;
+    }
+
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    RedisModule_UnblockClient(bc, NULL);
+    return;
 }
 
 static CommandInfoCtx* RedisGears_CommandCtxInfoCreate(const char* command, const char* callback, void* pd){
@@ -135,7 +227,7 @@ static CommandInfoCtx* RedisGears_CommandCtxInfoCreate(const char* command, cons
     CommandInfoCtx* cmdInfoCtx = RG_ALLOC(sizeof(*cmdInfoCtx));
     cmdInfoCtx->name = RG_STRDUP(command);
     cmdInfoCtx->callback = RG_STRDUP(callback);
-    cmdInfoCtx->pd = pd;
+    cmdInfoCtx->pd = type->dup(pd);
 
     strtolower(cmdInfoCtx->name);
 
@@ -146,14 +238,22 @@ static CommandInfoCtx* RedisGears_CommandCtxInfoCreate(const char* command, cons
 }
 
 int RG_CommandFilterAdd(const char* command, const char* callback, void* pd, char** err){
+
     CommandInfoCtx* cmdInfoCtx = RedisGears_CommandCtxInfoCreate(command, callback, pd);
     if(!cmdInfoCtx){
         *err = RG_STRDUP("Failed creating command info ctx");
         return REDISMODULE_ERR;
     }
 
+    if(strlen(cmdInfoCtx->name) >=3 && cmdInfoCtx->name[0] == 'r' && cmdInfoCtx->name[1] == 'g' && cmdInfoCtx->name[2] == '.'){
+        CommandFilter_RegisterArgFree(cmdInfoCtx);
+        *err = RG_STRDUP("Can not overide RedisGears commands");
+        return REDISMODULE_ERR;
+    }
+
     FlatExecutionPlan* fep = RGM_CreateCtx(ShardIDReader, err);
     if(!fep){
+        CommandFilter_RegisterArgFree(cmdInfoCtx);
         *err = RG_STRDUP("Failed creating flat execution");
         return REDISMODULE_ERR;
     }
@@ -175,7 +275,13 @@ int RG_CommandFilterRegister(const char* callbackName, RedisGears_CommandCallbac
     return REDISMODULE_OK;
 }
 
-static void CommandFilter_Free(void* arg){
+static void CommandFilter_UnregisterArgFree(void* arg){
+    CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = arg;
+    RG_FREE(cmdInfoUnregisterCtx->name);
+    RG_FREE(cmdInfoUnregisterCtx);
+}
+
+static void CommandFilter_RegisterArgFree(void* arg){
     CommandInfoCtx* cmdInfoCtx = arg;
     ArgType* type = CommandsMgmt_GetArgType(cmdInfoCtx->callback);
     if(cmdInfoCtx->pd){
@@ -186,7 +292,15 @@ static void CommandFilter_Free(void* arg){
     RG_FREE(cmdInfoCtx);
 }
 
-static void* CommandFilter_Duplicate(void* arg){
+static void* CommandFilter_UnregisterArgDuplicate(void* arg){
+    CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = arg;
+    CommandInfoUnregisterCtx* dup = RG_ALLOC(sizeof(*dup));
+    dup->name = RG_STRDUP(cmdInfoUnregisterCtx->name);
+    dup->index = cmdInfoUnregisterCtx->index;
+    return dup;
+}
+
+static void* CommandFilter_RegisterArgDuplicate(void* arg){
     CommandInfoCtx* cmdInfoCtx = arg;
     ArgType* type = CommandsMgmt_GetArgType(cmdInfoCtx->callback);
     CommandInfoCtx* dup = RG_ALLOC(sizeof(*dup));
@@ -196,7 +310,7 @@ static void* CommandFilter_Duplicate(void* arg){
     return dup;
 }
 
-static int CommandFilter_Serialize(FlatExecutionPlan* fep, void* arg, Gears_BufferWriter* bw, char** err){
+static int CommandFilter_RegisterArgSerialize(FlatExecutionPlan* fep, void* arg, Gears_BufferWriter* bw, char** err){
     CommandInfoCtx* cmdInfoCtx = arg;
     ArgType* type = CommandsMgmt_GetArgType(cmdInfoCtx->callback);
     RedisGears_BWWriteString(bw, cmdInfoCtx->name);
@@ -205,9 +319,28 @@ static int CommandFilter_Serialize(FlatExecutionPlan* fep, void* arg, Gears_Buff
     return type->serialize(fep, cmdInfoCtx->pd, bw, err);
 }
 
-static void* CommandFilter_Deserialize(FlatExecutionPlan* fep, Gears_BufferReader* br, int version, char** err){
-    if(version > COMMAND_FILTER_ARG_VERSION){
-        *err = RG_STRDUP("Command filter version is higher then mine, please upgrade to the newer RedisGears module version");
+static int CommandFilter_UnregisterArgSerialize(FlatExecutionPlan* fep, void* arg, Gears_BufferWriter* bw, char** err){
+    CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = arg;
+    RedisGears_BWWriteString(bw, cmdInfoUnregisterCtx->name);
+    RedisGears_BWWriteLong(bw, cmdInfoUnregisterCtx->index);
+    return REDISMODULE_OK;
+}
+
+static void* CommandFilter_UnregisterArgDeserialize(FlatExecutionPlan* fep, Gears_BufferReader* br, int version, char** err){
+    if(version > UNREGISTER_COMMAND_ARG_VERSION){
+        *err = RG_STRDUP("Command unregister version is higher than mine, please upgrade to the newer RedisGears module version");
+        return NULL;
+    }
+
+    CommandInfoUnregisterCtx* res = RG_ALLOC(sizeof(*res));
+    res->name = RG_STRDUP(RedisGears_BRReadString(br));
+    res->index = RedisGears_BRReadLong(br);
+    return res;
+}
+
+static void* CommandFilter_RegisterArgDeserialize(FlatExecutionPlan* fep, Gears_BufferReader* br, int version, char** err){
+    if(version > REGISTER_COMMAND_ARG_VERSION){
+        *err = RG_STRDUP("Command register version is higher than mine, please upgrade to the newer RedisGears module version");
         return NULL;
     }
     const char* name = RedisGears_BRReadString(br);
@@ -218,8 +351,37 @@ static void* CommandFilter_Deserialize(FlatExecutionPlan* fep, Gears_BufferReade
     return cmdInfoCtx;
 }
 
-static char* CommandFilter_ToString(void* arg){
-    return RG_STRDUP("CommandForEachCtx");
+static char* CommandFilter_RegisterArgToString(void* arg){
+    return RG_STRDUP("RegisterCmdCtx");
+}
+
+static char* CommandFilter_UnregisterArgToString(void* arg){
+    return RG_STRDUP("UnregisterCmdCtx");
+}
+
+static int CommandFilter_UnregisterFilterInternal(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    if(!invokedInternaly){
+        RedisModule_ReplyWithError(ctx, "This is an internal command and should not be invoked by user.");
+        return REDISMODULE_OK;
+    }
+    if(filterObj){
+        RedisModule_UnregisterCommandFilter(ctx, filterObj);
+        filterObj = NULL;
+    }
+    RedisModule_ReplyWithCString(ctx, "OK");
+    return REDISMODULE_OK;
+}
+
+static int CommandFilter_RegisterFilterInternal(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    if(!invokedInternaly){
+        RedisModule_ReplyWithError(ctx, "This is an internal command and should not be invoked by user.");
+        return REDISMODULE_OK;
+    }
+    if(!filterObj){
+        filterObj = RedisModule_RegisterCommandFilter(ctx, CommandFilter_Filter, 0);
+    }
+    RedisModule_ReplyWithSimpleString(ctx, "OK");
+    return REDISMODULE_OK;
 }
 
 static int CommandFilter_OverideSlaveCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
@@ -240,7 +402,7 @@ static int CommandFilter_OverideSlaveCommand(RedisModuleCtx *ctx, RedisModuleStr
     Gears_BufferReader br;
     Gears_BufferReaderInit(&br, &buff);
     char* err = NULL;
-    CommandInfoCtx* cmdInfoCtx = CommandFilter_Deserialize(NULL, &br, version, &err);
+    CommandInfoCtx* cmdInfoCtx = CommandFilter_RegisterArgDeserialize(NULL, &br, version, &err);
     if(!cmdInfoCtx){
         if(!err){
             err = RG_STRDUP("Failed deserialing command filter info");
@@ -252,7 +414,7 @@ static int CommandFilter_OverideSlaveCommand(RedisModuleCtx *ctx, RedisModuleStr
 
     CommandCtx* cmdCtx = CommandFilter_GetOrCreate(cmdInfoCtx->name);
     CommandFilter_AddCallbackCtx(cmdCtx, cmdInfoCtx);
-    CommandFilter_Free(cmdInfoCtx);
+    CommandFilter_RegisterArgFree(cmdInfoCtx);
 
     RedisModule_ReplicateVerbatim(ctx);
 
@@ -268,11 +430,109 @@ static int CommandFilter_OverideCommand(RedisModuleCtx *ctx, RedisModuleString *
     return REDISMODULE_OK;
 }
 
+static int CommandFilter_UnregisterCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    if(argc != 3){
+        return RedisModule_WrongArity(ctx);
+    }
+
+    const char* command = RedisModule_StringPtrLen(argv[1], NULL);
+    long long index;
+    if(RedisModule_StringToLongLong(argv[2], &index) != REDISMODULE_OK){
+        RedisModule_ReplyWithError(ctx, "Could not parse index argument");
+        return REDISMODULE_OK;
+    }
+
+    CommandCtx* cmdCtx = Gears_dictFetchValue(commandDict, command);
+    if(!cmdCtx){
+        RedisModule_ReplyWithError(ctx, "Given command does not exists");
+        return REDISMODULE_OK;
+    }
+
+    if(index < 0 || index >= array_len(cmdCtx->callbacks)){
+        RedisModule_ReplyWithError(ctx, "Given index out of range");
+        return REDISMODULE_OK;
+    }
+
+    CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = RG_ALLOC(sizeof(*cmdInfoUnregisterCtx));
+    cmdInfoUnregisterCtx->name = RG_STRDUP(command);
+    cmdInfoUnregisterCtx->index = index;
+
+    char* err = NULL;
+    FlatExecutionPlan* fep = RGM_CreateCtx(ShardIDReader, &err);
+    if(!fep){
+        if(!err){
+            err = RG_STRDUP("Failed creating execution to unregister command");
+        }
+        CommandFilter_UnregisterArgFree(cmdInfoUnregisterCtx);
+        RedisModule_ReplyWithError(ctx, "Failed creating execution to unregister command");
+        RG_FREE(err);
+        return REDISMODULE_ERR;
+    }
+
+    RGM_ForEach(fep, CommandFilter_UnregisterOnShard, cmdInfoUnregisterCtx);
+    ExecutionPlan* ep = RedisGears_Run(fep, ExecutionModeAsync, NULL, NULL, NULL, mgmtWorker, &err);
+    RedisGears_FreeFlatExecution(fep);
+    if(!ep){
+        if(!err){
+            err = RG_STRDUP("Failed running execution to unregister command");
+        }
+        RedisModule_ReplyWithError(ctx, err);
+        RG_FREE(err);
+        return REDISMODULE_ERR;
+    }
+
+    RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx, NULL, NULL, NULL, 0);
+    RedisGears_AddOnDoneCallback(ep, CommandFilter_SendReply, bc);
+    RedisGears_AddOnDoneCallback(ep, CommandFilter_dropExecutionOnDone, NULL);
+
+    return REDISMODULE_OK;
+}
+
+static int CommandFilter_DumpRegisteredCommands(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
+    if(argc != 1){
+        return RedisModule_WrongArity(ctx);
+    }
+
+    if(!commandDict){
+        RedisModule_ReplyWithArray(ctx, 0);
+        return REDISMODULE_OK;
+    }
+
+    RedisModule_ReplyWithArray(ctx, Gears_dictSize(commandDict));
+
+    Gears_dictIterator *iter = Gears_dictGetIterator(commandDict);
+    Gears_dictEntry* entry = NULL;
+    while((entry = Gears_dictNext(iter))){
+        CommandCtx* cmdCtx = Gears_dictGetVal(entry);
+        RedisModule_ReplyWithArray(ctx, 2);
+        RedisModule_ReplyWithCString(ctx, cmdCtx->name);
+
+        RedisModule_ReplyWithArray(ctx, array_len(cmdCtx->callbacks));
+
+        for(int i = 0 ; i < array_len(cmdCtx->callbacks) ; ++i){
+            RedisModule_ReplyWithArray(ctx, 2);
+            CallbackCtx* callback = cmdCtx->callbacks + i;
+            RedisModule_ReplyWithCString(ctx, callback->callbackName);
+            char* desc = callback->type->tostring(callback->pd);
+            RedisModule_ReplyWithCString(ctx, desc);
+            RG_FREE(desc);
+        }
+    }
+    Gears_dictReleaseIterator(iter);
+
+
+    return REDISMODULE_OK;
+}
+
+static void CommandFilter_FreeCallbackCtx(CallbackCtx* callbackCtx){
+    callbackCtx->type->free(callbackCtx->pd);
+    RG_FREE(callbackCtx->callbackName);
+}
+
 static void CommandFilter_FreeCommandCtx(CommandCtx* cmdCtx){
     RG_FREE(cmdCtx->name);
     for(size_t i = 0 ; i < array_len(cmdCtx->callbacks) ; ++i){
-        cmdCtx->callbacks[i].type->free(cmdCtx->callbacks[i].pd);
-        RG_FREE(cmdCtx->callbacks[i].callbackName);
+        CommandFilter_FreeCallbackCtx(cmdCtx->callbacks + i);
     }
     array_free(cmdCtx->callbacks);
     RG_FREE(cmdCtx);
@@ -365,6 +625,10 @@ static int CommandFilter_AuxLoad(RedisModuleIO *rdb, int encver, int when){
     CommandFilter_Clear(commandDict);
     commandDict = tempDict;
 
+    if(Gears_dictSize(commandDict) > 0){
+        CommandFilter_RegisterFilterIfNoRegitered();
+    }
+
     return REDISMODULE_OK;
 }
 
@@ -412,20 +676,41 @@ static void CommandFilter_RegisterDataType(RedisModuleCtx* ctx){
                 .aux_save_triggers = REDISMODULE_AUX_BEFORE_RDB,
             };
 
-    RedisModuleType *FilterDataType = RedisModule_CreateDataType(ctx, COMMAND_FILTER_DATATYPE_NAME, COMMAND_FILTER_DATATYPE_VERSION, &methods);
+    FilterDataType = RedisModule_CreateDataType(ctx, COMMAND_FILTER_DATATYPE_NAME, COMMAND_FILTER_DATATYPE_VERSION, &methods);
 }
 
 int CommandFilter_CommandFilterInit(RedisModuleCtx* ctx){
-    commandFilterArgType = RedisGears_CreateType("CommandFilterArg",
-                                                  COMMAND_FILTER_ARG_VERSION,
-                                                  CommandFilter_Free,
-                                                  CommandFilter_Duplicate,
-                                                  CommandFilter_Serialize,
-                                                  CommandFilter_Deserialize,
-                                                  CommandFilter_ToString);
-    RGM_RegisterForEach(CommandFilter_RegisterOnShard, commandFilterArgType);
+    registerCommandArgType = RedisGears_CreateType("CommandFilterArg",
+                                                  REGISTER_COMMAND_ARG_VERSION,
+                                                  CommandFilter_RegisterArgFree,
+                                                  CommandFilter_RegisterArgDuplicate,
+                                                  CommandFilter_RegisterArgSerialize,
+                                                  CommandFilter_RegisterArgDeserialize,
+                                                  CommandFilter_RegisterArgToString);
 
-    filterObj = RedisModule_RegisterCommandFilter(ctx, CommandFilter_Filter, 0);
+    unregisterCommandArgType = RedisGears_CreateType("CommandFilterArg",
+                                                  UNREGISTER_COMMAND_ARG_VERSION,
+                                                  CommandFilter_UnregisterArgFree,
+                                                  CommandFilter_UnregisterArgDuplicate,
+                                                  CommandFilter_UnregisterArgSerialize,
+                                                  CommandFilter_UnregisterArgDeserialize,
+                                                  CommandFilter_UnregisterArgToString);
+
+    RGM_RegisterForEach(CommandFilter_RegisterOnShard, registerCommandArgType);
+
+    RGM_RegisterForEach(CommandFilter_UnregisterOnShard, unregisterCommandArgType);
+
+
+
+    if (RedisModule_CreateCommand(ctx, "rg.unregistercommand", CommandFilter_UnregisterCommand, "readonly", 0, 0, 0) != REDISMODULE_OK) {
+        RedisModule_Log(ctx, "warning", "could not register command rg.unregistercommand");
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_CreateCommand(ctx, "rg.dumpregisteredcommands", CommandFilter_DumpRegisteredCommands, "readonly", 0, 0, 0) != REDISMODULE_OK) {
+        RedisModule_Log(ctx, "warning", "could not register command rg.unregistercommand");
+        return REDISMODULE_ERR;
+    }
 
     if (RedisModule_CreateCommand(ctx, INNER_OVERIDE_COMMAND, CommandFilter_OverideCommand, "readonly", 0, 0, 0) != REDISMODULE_OK) {
         RedisModule_Log(ctx, "warning", "could not register command "INNER_OVERIDE_COMMAND);
@@ -434,6 +719,16 @@ int CommandFilter_CommandFilterInit(RedisModuleCtx* ctx){
 
     if (RedisModule_CreateCommand(ctx, INNER_OVERIDE_SLAVE_COMMAND, CommandFilter_OverideSlaveCommand, "readonly", 0, 0, 0) != REDISMODULE_OK) {
         RedisModule_Log(ctx, "warning", "could not register command "INNER_OVERIDE_SLAVE_COMMAND);
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_CreateCommand(ctx, INNER_REGISTER_COMMAND_FILTER, CommandFilter_RegisterFilterInternal, "readonly", 0, 0, 0) != REDISMODULE_OK) {
+        RedisModule_Log(ctx, "warning", "could not register command "INNER_REGISTER_COMMAND_FILTER);
+        return REDISMODULE_ERR;
+    }
+
+    if (RedisModule_CreateCommand(ctx, INNER_UNREGISTER_COMMAND_FILTER, CommandFilter_UnregisterFilterInternal, "readonly", 0, 0, 0) != REDISMODULE_OK) {
+        RedisModule_Log(ctx, "warning", "could not register command "INNER_UNREGISTER_COMMAND_FILTER);
         return REDISMODULE_ERR;
     }
 
