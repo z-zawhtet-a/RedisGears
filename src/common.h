@@ -11,6 +11,7 @@
 #include "utils/dict.h"
 #include "redismodule.h"
 #include <stdio.h>
+#include <ctype.h>
 
 #if defined(DEBUG) || !defined(NDEBUG)
 #include "readies/cetara/diag/gdb.h"
@@ -50,6 +51,15 @@ char* ArrToStr(void** arr, size_t len, char*(*toStr)(void*));
 const char* GetShardUniqueId();
 int ExecCommand(RedisModuleCtx *ctx, const char* __fmt, ...);
 int ExecCommandVList(RedisModuleCtx *ctx, const char* logLevel, const char* __fmt, va_list __arg);
+
+static char *strtolower(char *str) {
+  char *p = str;
+  while (*p) {
+    *p = tolower(*p);
+    p++;
+  }
+  return str;
+}
 
 #endif /* SRC_COMMANDS_H_ */
 

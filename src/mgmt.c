@@ -45,6 +45,7 @@ GENERATE(ExecutionOnUnpaused)
 GENERATE(FlatExecutionOnRegistered)
 GENERATE(FlatExecutionOnUnregistered)
 GENERATE(KeysReaderReadRecord)
+GENERATE(Command)
 
 void Mgmt_Init(){
     FiltersMgmt_Init();
@@ -61,4 +62,5 @@ void Mgmt_Init(){
     FlatExecutionOnRegisteredsMgmt_Init();
     FlatExecutionOnUnregisteredsMgmt_Init();
     KeysReaderReadRecordsMgmt_Init();
+    CommandsMgmt_Init();
 }

@@ -10,7 +10,7 @@
 #endif
 
 static ExecutionThreadPool* mgmtPool;
-static WorkerData* mgmtWorker;
+WorkerData* mgmtWorker;
 
 #define STRING_TYPE_VERSION 1
 

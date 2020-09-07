@@ -29,6 +29,7 @@
 #include "readers/command_reader.h"
 #include "readers/shardid_reader.h"
 #include "mappers.h"
+#include "command_filter.h"
 #include <stdbool.h>
 #include <unistd.h>
 #include "lock_handler.h"
@@ -923,6 +924,9 @@ static int RedisGears_RegisterApi(RedisModuleCtx* ctx){
     REGISTER_API(KeysReaderTriggerArgsSetReadRecordCallback, ctx);
     REGISTER_API(KeysReaderRegisterReadRecordCallback, ctx);
 
+    REGISTER_API(CommandFilterAdd, ctx);
+    REGISTER_API(CommandFilterRegister, ctx);
+
     return REDISMODULE_OK;
 }
 
@@ -1114,6 +1118,11 @@ int RedisGears_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     RGM_RegisterForEach(AddToStream, NULL);
 
     ExecutionPlan_Initialize();
+
+    if(CommandFilter_CommandFilterInit(ctx) != REDISMODULE_OK){
+        RedisModule_Log(ctx, "warning", "could not initialize command filter");
+        return REDISMODULE_ERR;
+    }
 
     Cluster_RegisterMsgReceiverM(RG_OnDropExecutionMsgReceived);
     Cluster_RegisterMsgReceiverM(RG_NetworkTest);

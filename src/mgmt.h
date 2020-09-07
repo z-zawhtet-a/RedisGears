@@ -87,6 +87,10 @@ bool KeysReaderReadRecordsMgmt_Add(const char* name, RedisGears_KeysReaderReadRe
 RedisGears_KeysReaderReadRecordCallback KeysReaderReadRecordsMgmt_Get(const char* name);
 ArgType* KeysReaderReadRecordsMgmt_GetArgType(const char* name);
 
+bool CommandsMgmt_Add(const char* name, RedisGears_CommandCallback callback, ArgType* type);
+RedisGears_CommandCallback CommandsMgmt_Get(const char* name);
+ArgType* CommandsMgmt_GetArgType(const char* name);
+
 void Mgmt_Init();
 
 

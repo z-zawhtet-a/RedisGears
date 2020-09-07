@@ -181,6 +181,17 @@ typedef Record* (*RedisGears_AccumulateCallback)(ExecutionCtx* rctx, Record *acc
 typedef Record* (*RedisGears_AccumulateByKeyCallback)(ExecutionCtx* rctx, char* key, Record *accumulate, Record *r, void* arg);
 
 /**
+ * Command filter def
+ */
+typedef int (*RedisGears_CommandCallback)(RedisModuleCtx* ctx, RedisModuleString** argv, size_t argc, void* pd);
+
+int MODULE_API_FUNC(RedisGears_CommandFilterAdd)(const char* command, const char* callback, void* pd, char** err);
+#define RGM_CommandFilterAdd(c, call, pd, e) RedisGears_CommandFilterAdd(c, #call, pd, e)
+
+int MODULE_API_FUNC(RedisGears_CommandFilterRegister)(const char* callbackName, RedisGears_CommandCallback callback, ArgType* type);
+#define RGM_CommandFilterRegister(callback, type) RedisGears_CommandFilterRegister(#callback, callback, type);
+
+/**
  * Reader ctx definition
  */
 typedef struct KeysReaderCtx KeysReaderCtx;
@@ -279,7 +290,7 @@ int MODULE_API_FUNC(RedisGears_RegisterForEach)(char* name, RedisGears_ForEachCa
 int MODULE_API_FUNC(RedisGears_RegisterMap)(char* name, RedisGears_MapCallback map, ArgType* type);
 int MODULE_API_FUNC(RedisGears_RegisterAccumulator)(char* name, RedisGears_AccumulateCallback accumulator, ArgType* type);
 int MODULE_API_FUNC(RedisGears_RegisterAccumulatorByKey)(char* name, RedisGears_AccumulateByKeyCallback accumulator, ArgType* type);
-int MODULE_API_FUNC(RedisGears_RegisterFilter)(char* name, RedisGears_FilterCallback filter, ArgType* type);
+int MODULE_API_FUNC(RedisGears_RegisterFilter)(char* name, RedisGears_FilterCallback filterObj, ArgType* type);
 int MODULE_API_FUNC(RedisGears_RegisterGroupByExtractor)(char* name, RedisGears_ExtractorCallback extractor, ArgType* type);
 int MODULE_API_FUNC(RedisGears_RegisterReducer)(char* name, RedisGears_ReducerCallback reducer, ArgType* type);
 int MODULE_API_FUNC(RedisGears_RegisterExecutionOnStartCallback)(char* name, RedisGears_ExecutionOnStartCallback callback, ArgType* type);
@@ -877,6 +888,9 @@ static int RedisGears_Initialize(RedisModuleCtx* ctx, const char* name, int vers
     REDISGEARS_MODULE_INIT_FUNCTION(ctx, RegisterPlugin);
 
     REDISGEARS_MODULE_INIT_FUNCTION(ctx, ExecutionPlanIsLocal);
+
+    REDISGEARS_MODULE_INIT_FUNCTION(ctx, CommandFilterAdd);
+    REDISGEARS_MODULE_INIT_FUNCTION(ctx, CommandFilterRegister);
 
     if(RedisGears_GetLLApiVersion() < REDISGEARS_LLAPI_VERSION){
         return REDISMODULE_ERR;

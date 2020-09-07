@@ -11,6 +11,8 @@
 
 #include "redisgears.h"
 
+extern WorkerData* mgmtWorker;
+
 void Command_ReturnResults(ExecutionPlan* gearsCtx, RedisModuleCtx *ctx);
 void Command_ReturnErrors(ExecutionPlan* gearsCtx, RedisModuleCtx *ctx);
 void Command_ReturnResultsAndErrors(ExecutionPlan* gearsCtx, RedisModuleCtx *ctx);
