@@ -11,7 +11,7 @@
 #define REGISTER_COMMAND_ARG_VERSION 1
 #define UNREGISTER_COMMAND_ARG_VERSION 1
 
-#define INNER_OVERIDE_COMMAND "rg.inneroveride"
+#define INNER_OVERIDE_COMMAND "rg.execute"
 #define INNER_OVERIDE_SLAVE_COMMAND "rg.inneroverideslave"
 #define INNER_REGISTER_COMMAND_FILTER "rg.innerregistercommandfilter"
 #define INNER_UNREGISTER_COMMAND_FILTER "rg.innerunregistercommandfilter"
@@ -109,6 +109,7 @@ static void CommandFilter_Filter(RedisModuleCommandFilterCtx *filter){
         return;
     }
     currCmdCtx = cmdCtx;
+    RedisModule_RetainString(NULL, overideCmdName);
     RedisModule_CommandFilterArgInsert(filter, 0, overideCmdName);
 }
 
@@ -150,17 +151,19 @@ static void CommandFilter_UnregisterOnShard(ExecutionCtx* rctx, Record *data, vo
         return;
     }
 
-    if(cmdInfoUnregisterCtx->index < 0 || cmdInfoUnregisterCtx->index >= array_len(cmdCtx->callbacks)){
-        RedisGears_SetError(rctx, RG_STRDUP("Give index is out of range"));
-        LockHandler_Release(ctx);
-        return;
+    if(cmdInfoUnregisterCtx->index != -1){
+        if(cmdInfoUnregisterCtx->index < 0 || cmdInfoUnregisterCtx->index >= array_len(cmdCtx->callbacks)){
+            RedisGears_SetError(rctx, RG_STRDUP("Give index is out of range"));
+            LockHandler_Release(ctx);
+            return;
+        }
+
+        CommandFilter_FreeCallbackCtx(cmdCtx->callbacks + cmdInfoUnregisterCtx->index);
+        array_del(cmdCtx->callbacks, cmdInfoUnregisterCtx->index);
+        --cmdCtx->index;
     }
 
-    CommandFilter_FreeCallbackCtx(cmdCtx->callbacks + cmdInfoUnregisterCtx->index);
-    array_del(cmdCtx->callbacks, cmdInfoUnregisterCtx->index);
-    --cmdCtx->index;
-
-    if(array_len(cmdCtx->callbacks) == 0){
+    if(array_len(cmdCtx->callbacks) == 0 || cmdInfoUnregisterCtx->index == -1){
         Gears_dictDelete(commandDict, cmdInfoUnregisterCtx->name);
         CommandFilter_FreeCommandCtx(cmdCtx);
         if(Gears_dictSize(commandDict) == 0){
@@ -211,10 +214,12 @@ static void CommandFilter_SendReply(ExecutionPlan* ep, void* privateData){
         const char* errorStr = RedisGears_StringRecordGet(error, NULL);
         RedisModule_ReplyWithError(ctx, errorStr);
         return;
+    }else{
+        RedisModule_ReplyWithSimpleString(ctx, "OK");
     }
 
-    RedisModule_ReplyWithSimpleString(ctx, "OK");
     RedisModule_UnblockClient(bc, NULL);
+    RedisModule_FreeThreadSafeContext(ctx);
     return;
 }
 
@@ -227,7 +232,10 @@ static CommandInfoCtx* RedisGears_CommandCtxInfoCreate(const char* command, cons
     CommandInfoCtx* cmdInfoCtx = RG_ALLOC(sizeof(*cmdInfoCtx));
     cmdInfoCtx->name = RG_STRDUP(command);
     cmdInfoCtx->callback = RG_STRDUP(callback);
-    cmdInfoCtx->pd = type->dup(pd);
+    cmdInfoCtx->pd = NULL;
+    if(pd){
+        cmdInfoCtx->pd = type->dup(pd);
+    }
 
     strtolower(cmdInfoCtx->name);
 
@@ -423,6 +431,25 @@ static int CommandFilter_OverideSlaveCommand(RedisModuleCtx *ctx, RedisModuleStr
 
 static int CommandFilter_OverideCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
     CommandCtx* cmdCtx = currCmdCtx;
+    currCmdCtx = NULL;
+    if(!cmdCtx){
+        if(argc < 2){
+            return RedisModule_WrongArity(ctx);
+        }
+        RedisModuleString *commandName = argv[1];
+        size_t cmdNameLen;
+        const char* commandNameCStr = RedisModule_StringPtrLen(commandName, &cmdNameLen);
+        char commandNameToLower[cmdNameLen + 1];
+        for(size_t i = 0 ; i < cmdNameLen ; ++i){
+            commandNameToLower[i] = tolower(commandNameCStr[i]);
+        }
+        commandNameToLower[cmdNameLen] = '\0';
+        cmdCtx = Gears_dictFetchValue(commandDict, commandNameToLower);
+        if(!cmdCtx){
+            RedisModule_ReplyWithError(ctx, "Unknown command");
+            return REDISMODULE_OK;
+        }
+    }
     CallbackCtx* callback = cmdCtx->callbacks + cmdCtx->index;
     --cmdCtx->index;
     callback->callback(ctx, argv + 1, argc - 1, callback->pd);
@@ -431,30 +458,39 @@ static int CommandFilter_OverideCommand(RedisModuleCtx *ctx, RedisModuleString *
 }
 
 static int CommandFilter_UnregisterCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
-    if(argc != 3){
+    if(argc < 2 || argc > 3){
         return RedisModule_WrongArity(ctx);
     }
 
-    const char* command = RedisModule_StringPtrLen(argv[1], NULL);
-    long long index;
-    if(RedisModule_StringToLongLong(argv[2], &index) != REDISMODULE_OK){
-        RedisModule_ReplyWithError(ctx, "Could not parse index argument");
-        return REDISMODULE_OK;
-    }
+    size_t cmdNameLen;
+    const char* command = RedisModule_StringPtrLen(argv[1], &cmdNameLen);
+    long long index = -1;
 
-    CommandCtx* cmdCtx = Gears_dictFetchValue(commandDict, command);
+    char commandNameToLower[cmdNameLen + 1];
+    for(size_t i = 0 ; i < cmdNameLen ; ++i){
+        commandNameToLower[i] = tolower(command[i]);
+    }
+    commandNameToLower[cmdNameLen] = '\0';
+
+    CommandCtx* cmdCtx = Gears_dictFetchValue(commandDict, commandNameToLower);
     if(!cmdCtx){
         RedisModule_ReplyWithError(ctx, "Given command does not exists");
         return REDISMODULE_OK;
     }
 
-    if(index < 0 || index >= array_len(cmdCtx->callbacks)){
-        RedisModule_ReplyWithError(ctx, "Given index out of range");
-        return REDISMODULE_OK;
+    if(argc == 3){
+        if(RedisModule_StringToLongLong(argv[2], &index) != REDISMODULE_OK){
+            RedisModule_ReplyWithError(ctx, "Could not parse index argument");
+            return REDISMODULE_OK;
+        }
+        if(index < 0 || index >= array_len(cmdCtx->callbacks)){
+            RedisModule_ReplyWithError(ctx, "Given index out of range");
+            return REDISMODULE_OK;
+        }
     }
 
     CommandInfoUnregisterCtx* cmdInfoUnregisterCtx = RG_ALLOC(sizeof(*cmdInfoUnregisterCtx));
-    cmdInfoUnregisterCtx->name = RG_STRDUP(command);
+    cmdInfoUnregisterCtx->name = RG_STRDUP(commandNameToLower);
     cmdInfoUnregisterCtx->index = index;
 
     char* err = NULL;
@@ -590,8 +626,8 @@ static int CommandFilter_AuxLoad(RedisModuleIO *rdb, int encver, int when){
             RedisModule_Free(callbackName);
 
 
-            callbackCtx.type = CommandsMgmt_GetArgType(callbackName);
-            callbackCtx.callback = CommandsMgmt_Get(callbackName);
+            callbackCtx.type = CommandsMgmt_GetArgType(callbackCtx.callbackName);
+            callbackCtx.callback = CommandsMgmt_Get(callbackCtx.callbackName);
 
             if(!callbackCtx.type || !callbackCtx.callback){
                 RedisModule_LogIOError(rdb, "warning", "Failed finding callback for command filter, callback='%s'", callbackName);
